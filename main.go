@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -12,13 +13,27 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
+const dialTimeout = 30 * time.Second
+
+// dialWithTimeout wraps a proxy.Dialer with a timeout.
+// Uses ContextDialer if available, otherwise falls back to plain Dial.
+func dialWithTimeout(d proxy.Dialer, network, addr string) (net.Conn, error) {
+	if cd, ok := d.(proxy.ContextDialer); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		defer cancel()
+		return cd.DialContext(ctx, network, addr)
+	}
+	return d.Dial(network, addr)
+}
+
 type httpProxyHandler struct {
-	onion      proxy.Dialer
-	i2p        proxy.Dialer
-	loki       proxy.Dialer
-	verbose    bool
+	onion       proxy.Dialer
+	i2p         proxy.Dialer
+	loki        proxy.Dialer
+	verbose     bool
 	passthrough string
 }
 
@@ -49,15 +64,15 @@ func (h *httpProxyHandler) dialOut(addr string) (net.Conn, error) {
 	if port == "" {
 		port = "80" // Default to port 80 if not specified
 	}
-	
+
 	// Check if it's a clearnet URL and passthrough is set to clearnet
 	if h.passthrough == "clearnet" && !strings.HasSuffix(host, ".onion") && !strings.HasSuffix(host, ".i2p") && !strings.HasSuffix(host, ".loki") {
 		if h.verbose {
 			fmt.Printf("Using clearnet for: %s\n", host)
 		}
-		return net.Dial("tcp", fmt.Sprintf("%s:%s", host, port))
+		return net.DialTimeout("tcp", fmt.Sprintf("%s:%s", host, port), dialTimeout)
 	}
-	
+
 	if strings.HasSuffix(host, ".loki") {
 		if h.verbose {
 			fmt.Printf("Using lokinet for: %s\n", host)
@@ -65,7 +80,7 @@ func (h *httpProxyHandler) dialOut(addr string) (net.Conn, error) {
 		if h.loki == nil {
 			return nil, fmt.Errorf("lokinet proxy not configured")
 		}
-		return h.loki.Dial("tcp", fmt.Sprintf("%s:%s", host, port))
+		return dialWithTimeout(h.loki, "tcp", fmt.Sprintf("%s:%s", host, port))
 	}
 	if strings.HasSuffix(host, ".i2p") {
 		if h.verbose {
@@ -74,7 +89,7 @@ func (h *httpProxyHandler) dialOut(addr string) (net.Conn, error) {
 		if h.i2p == nil {
 			return nil, fmt.Errorf("i2p proxy not configured")
 		}
-		return h.i2p.Dial("tcp", fmt.Sprintf("%s:%s", host, port))
+		return dialWithTimeout(h.i2p, "tcp", fmt.Sprintf("%s:%s", host, port))
 	}
 	if h.verbose {
 		fmt.Printf("Using tor for: %s\n", host)
@@ -82,14 +97,14 @@ func (h *httpProxyHandler) dialOut(addr string) (net.Conn, error) {
 	if h.onion == nil {
 		return nil, fmt.Errorf("tor proxy not configured")
 	}
-	return h.onion.Dial("tcp", fmt.Sprintf("%s:%s", host, port))
+	return dialWithTimeout(h.onion, "tcp", fmt.Sprintf("%s:%s", host, port))
 }
 
 func (h *httpProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.verbose {
 		fmt.Printf("Received request: %s %s\n", r.Method, r.Host)
 	}
-	
+
 	if r.Method == http.MethodConnect {
 		outConn, err := h.dialOut(r.Host)
 		if err != nil {
@@ -130,12 +145,12 @@ func main() {
 	// Required flags
 	proto := flag.String("proto", "", "Protocol to use (http or socks)")
 	bindAddr := flag.String("bind", "", "Address to bind to (e.g., 127.0.0.1:2000)")
-	
+
 	// Optional proxy flags
 	onionSocks := flag.String("tor", "", "Tor SOCKS proxy address (e.g., 127.0.0.1:9050)")
 	i2pSocks := flag.String("i2p", "", "I2P SOCKS proxy address (e.g., 127.0.0.1:4447)")
 	lokiSocks := flag.String("loki", "", "Lokinet SOCKS proxy address (e.g., 127.0.0.1:9050)")
-	
+
 	// Other flags
 	verbose := flag.Bool("verbose", false, "Enable verbose logging")
 	passthrough := flag.String("passthrough", "", "Set passthrough mode (e.g., 'clearnet' for direct clearnet access)")
@@ -199,10 +214,10 @@ func main() {
 		serv := &http.Server{
 			Addr: *bindAddr,
 			Handler: &httpProxyHandler{
-				onion:      onionsock,
-				i2p:        i2psock,
-				loki:       lokisock,
-				verbose:    *verbose,
+				onion:       onionsock,
+				i2p:         i2psock,
+				loki:        lokisock,
+				verbose:     *verbose,
 				passthrough: *passthrough,
 			},
 			TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
@@ -225,15 +240,15 @@ func main() {
 				if err != nil {
 					return nil, err
 				}
-				
+
 				// Check if it's a clearnet URL and passthrough is set to clearnet
 				if *passthrough == "clearnet" && !strings.HasSuffix(host, ".onion") && !strings.HasSuffix(host, ".i2p") && !strings.HasSuffix(host, ".loki") {
 					if *verbose {
 						fmt.Printf("Using clearnet for: %s\n", host)
 					}
-					return net.Dial("tcp", addr)
+					return net.DialTimeout("tcp", addr, dialTimeout)
 				}
-				
+
 				if strings.HasSuffix(host, ".loki") {
 					if *verbose {
 						fmt.Printf("Using lokinet for: %s\n", host)
@@ -241,7 +256,7 @@ func main() {
 					if lokisock == nil {
 						return nil, fmt.Errorf("lokinet proxy not configured")
 					}
-					return lokisock.Dial("tcp", addr)
+					return dialWithTimeout(lokisock, "tcp", addr)
 				}
 				if strings.HasSuffix(host, ".i2p") {
 					if *verbose {
@@ -250,7 +265,7 @@ func main() {
 					if i2psock == nil {
 						return nil, fmt.Errorf("i2p proxy not configured")
 					}
-					return i2psock.Dial("tcp", addr)
+					return dialWithTimeout(i2psock, "tcp", addr)
 				}
 				if *verbose {
 					fmt.Printf("Using tor for: %s\n", host)
@@ -258,7 +273,7 @@ func main() {
 				if onionsock == nil {
 					return nil, fmt.Errorf("tor proxy not configured")
 				}
-				return onionsock.Dial("tcp", addr)
+				return dialWithTimeout(onionsock, "tcp", addr)
 			},
 		})
 
